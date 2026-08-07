@@ -21,6 +21,12 @@ const WORLD_SCALE := 5.0
 const MAX_TIP_OFFSET := 0.88
 const POST_IMPACT_HOLD_SECONDS := 0.045
 const FADE_OUT_SECONDS := 0.12
+## Animated stand-in for a human's live drag (see animate_ai_stroke) - slowed
+## well past a real stroke's speed so the AI's shot reads as a deliberate
+## swing instead of an instant snap.
+const AI_BACKSWING_SECONDS := 0.9
+const AI_BACKSWING_HOLD_SECONDS := 0.15
+const AI_FORWARD_SWING_SECONDS := 0.5
 ## No real stroke lands on a mathematically perfect line: grip, tip contact,
 ## and the stick's own flex all carry a hair of unavoidable wobble. A truly
 ## zero-error hit collapses a dead-center rack contact into a pure stun (the
@@ -47,6 +53,7 @@ var _spin_input_active := false
 var _suppress_power_phase_change := false
 var _post_impact_elapsed := 0.0
 var _fade_elapsed := 0.0
+var _hidden_for_thinking := false
 
 var aim_direction := Vector3.FORWARD:
 	set(value):
@@ -84,6 +91,9 @@ func _ready() -> void:
 
 func _process(delta: float) -> void:
 	if cue_ball == null or cue_ball.pocketed:
+		visible = false
+		return
+	if _hidden_for_thinking:
 		visible = false
 		return
 	if input_phase != InputPhase.RESOLVING:
@@ -148,6 +158,34 @@ func cancel_shot_input() -> void:
 	_locked_aim_direction = aim_direction
 	if cue_ball != null and not cue_ball.pocketed:
 		_set_cue_visible(true)
+
+
+## Hides the cue stick while the AI is "thinking" (planning a shot or placing
+## a ball-in-hand cue ball) instead of leaving it resting idle at the table -
+## it only reappears for animate_ai_stroke()'s backswing.
+func set_hidden_for_thinking(hidden: bool) -> void:
+	_hidden_for_thinking = hidden
+
+
+## Animated stand-in for a human's live power-drag: pulls the cue back to the
+## given power's distance, holds briefly, then drives it forward onto the
+## ball, entirely through the ordinary pull_amount used by human input so the
+## visual matches a real stroke. Leaves the cue aimed and at pull_amount 0,
+## ready for take_shot() to fire the actual impulse.
+func animate_ai_stroke(power_ratio: float) -> void:
+	if cue_ball == null or cue_ball.pocketed:
+		return
+	set_hidden_for_thinking(false)
+	_reset_pull_amount()
+	var target_pull := clampf(power_ratio, 0.0, 1.0)
+	var tree := get_tree()
+	var backswing := tree.create_tween()
+	backswing.tween_property(self, "pull_amount", target_pull, AI_BACKSWING_SECONDS).set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_OUT)
+	await backswing.finished
+	await tree.create_timer(AI_BACKSWING_HOLD_SECONDS).timeout
+	var forward_swing := tree.create_tween()
+	forward_swing.tween_property(self, "pull_amount", 0.0, AI_FORWARD_SWING_SECONDS).set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_IN)
+	await forward_swing.finished
 
 
 func set_ready_to_shoot() -> void:

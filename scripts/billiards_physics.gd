@@ -350,6 +350,10 @@ func _resolve_ball_pairs() -> void:
 			var second: Dictionary = _states[ids[j]]
 			if bool(first["pocketed"]) or bool(second["pocketed"]):
 				continue
+			# Two balls that are both already at rest cannot newly overlap - if
+			# they weren't touching when they fell asleep, they still aren't.
+			if bool(first["sleeping"]) and bool(second["sleeping"]):
+				continue
 			var delta: Vector3 = second["position"] - first["position"]
 			delta.y = 0.0
 			var contact_distance: float = float(first["radius"]) + float(second["radius"])
@@ -367,6 +371,12 @@ func _resolve_table(dt: float) -> void:
 			continue
 		var state: Dictionary = _states[id]
 		if bool(state["pocketed"]):
+			continue
+		# A sleeping ball hasn't moved and can't have drifted into a cushion or
+		# pocket since it last resolved cleanly against them. If a pair
+		# collision above just woke it this same step, "sleeping" is already
+		# false by the time we get here, so it still gets checked.
+		if bool(state["sleeping"]):
 			continue
 		# Resolve a valid pocket entry before its surrounding jaw or rail boxes.
 		# The capture test already requires an inward shot, throat alignment and a

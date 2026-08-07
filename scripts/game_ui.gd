@@ -37,6 +37,7 @@ var _pad_down := false
 var _pad_left := false
 var _pad_right := false
 var _eight_call_available := false
+var _shot_controls_requested := true
 var _rolling_preview_visible := false
 var _pocket_marker_buttons: Dictionary = {} # pocket id -> Button
 var _preview_style_normal: StyleBoxFlat
@@ -77,8 +78,16 @@ func _update_preview_visibility() -> void:
 
 
 ## Power/spin controls only make sense while it's the human's turn to strike;
-## hidden while balls are rolling or the AI is taking its shot.
+## hidden while balls are rolling, the AI is taking its shot, or (once the
+## table's down to just the 8-ball) the player hasn't called a pocket yet -
+## see _update_shot_controls_visibility.
 func set_shot_controls_visible(shown: bool) -> void:
+	_shot_controls_requested = shown
+	_update_shot_controls_visibility()
+
+func _update_shot_controls_visibility() -> void:
+	var needs_pick := _eight_call_available and GameManager.called_eight_pocket == ""
+	var shown: bool = _shot_controls_requested and not needs_pick
 	power_zone.visible = shown
 	spin_pad.visible = shown
 
@@ -121,6 +130,7 @@ func _process(_delta: float) -> void:
 		pick_pocket_label.visible = false
 		_eight_call_available = false
 		_update_preview_visibility()
+		_update_shot_controls_visibility()
 		return
 	# Ball-in-hand placement owns the status label while it's active (turn
 	# message vs. the invalid-position warning) - don't stomp it every frame.
@@ -130,6 +140,7 @@ func _process(_delta: float) -> void:
 	# table), so the picker must stay available alongside the placement pad
 	# rather than being hidden for the whole ball-in-hand duration.
 	_refresh_eight_ball_call()
+	_update_shot_controls_visibility()
 	if GameManager.ball_in_hand:
 		return
 	if game_ref and not _charging:
@@ -258,17 +269,17 @@ func _on_pocket_marker_pressed(pocket_id: String) -> void:
 	if not game_ref.has_method("call_eight_pocket"):
 		return
 	if bool(game_ref.call("call_eight_pocket", pocket_id)):
-		set_status("8-ball called: %s" % _pocket_label(pocket_id))
+		set_status("8-ball called: %s" % pocket_label(pocket_id))
 
 
 ## Syncs the preview marker to a pocket called by clicking it directly on
 ## the table (see Game._try_click_eight_pocket), so both input paths agree.
 func select_called_pocket(pocket_id: String) -> void:
 	_update_marker_highlight(pocket_id)
-	set_status("8-ball called: %s" % _pocket_label(pocket_id))
+	set_status("8-ball called: %s" % pocket_label(pocket_id))
 
 
-func _pocket_label(pocket_id: String) -> String:
+func pocket_label(pocket_id: String) -> String:
 	for pocket in EIGHT_BALL_POCKETS:
 		if pocket["id"] == pocket_id:
 			return str(pocket["label"])

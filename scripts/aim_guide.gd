@@ -32,7 +32,12 @@ const MAX_PREVIEW_STEPS := 3000
 # to hit, so a combo can be lined up visually. Capped so a wild break-like
 # scatter can't produce an unbounded number of chain segments to draw.
 const MAX_EXTENDED_CONTACTS := 4
-const RECOMPUTE_INTERVAL := 0.12
+# Aim must hold still this long before a trace is dispatched. Debounced
+# rather than throttled: while the camera is being dragged fast the aim
+# changes every frame, so no calc ever fires and no backlog can build up.
+# The instant it stops, one fresh trace fires using the settled aim - no
+# stale mid-drag result lingers because none was ever dispatched for it.
+const AIM_SETTLE_DELAY := 0.06
 const VECTOR_LINE_SCALE := 0.16 # world units of drawn line per m/s of predicted speed
 const AIM_EPSILON := 0.0005
 const IMPACT_COLOR := Color(1.0, 0.92, 0.4, 0.9)
@@ -48,7 +53,6 @@ var enabled := false:
 		if not enabled:
 			_clear()
 
-var _recompute_elapsed := 0.0
 var _shadow: BilliardsPhysics = null
 var _shadow_ready := false
 
@@ -80,6 +84,16 @@ var _last_tip_offset := Vector3.ZERO
 var _last_power := -1.0
 var _last_cue_position := Vector3.ZERO
 var _has_last_prediction := false
+
+# Debounce state: tracks the most recent frame's aim so we can tell whether
+# it's still changing, independent of whether a dispatch has happened yet.
+var _candidate_direction := Vector3.ZERO
+var _candidate_tip_offset := Vector3.ZERO
+var _candidate_power := -1.0
+var _candidate_cue_position := Vector3.ZERO
+var _candidate_strike: Dictionary = {}
+var _has_candidate := false
+var _settle_elapsed := 0.0
 
 @onready var impact_line: MeshInstance3D = $ImpactLine
 @onready var cue_vector_line: MeshInstance3D = $CueVectorLine
@@ -121,20 +135,12 @@ func _process(delta: float) -> void:
 	if game.ai_turn_active:
 		_clear()
 		_has_last_prediction = false
+		_has_candidate = false
 		return
-	_recompute_elapsed += delta
-	if _recompute_elapsed < RECOMPUTE_INTERVAL:
-		return
-	_recompute_elapsed = 0.0
-
 	if game.cue_ball == null or game.cue_ball.pocketed or not game.can_shoot():
 		_clear()
 		_has_last_prediction = false
-		return
-
-	# A prediction is already running - try again next tick rather than
-	# starting a second task, since only one may touch _shadow at a time.
-	if _task_in_flight:
+		_has_candidate = false
 		return
 
 	var cue_stick: Node = game.cue_stick
@@ -149,20 +155,55 @@ func _process(delta: float) -> void:
 	var tip_offset: Vector3 = strike["tip_offset"]
 	var cue_position: Vector3 = game.cue_ball.global_position
 
-	if _has_last_prediction \
-			and direction.is_equal_approx(_last_direction) \
-			and tip_offset.is_equal_approx(_last_tip_offset) \
-			and is_equal_approx(power, _last_power) \
-			and cue_position.distance_squared_to(_last_cue_position) < AIM_EPSILON * AIM_EPSILON:
+	if _has_candidate \
+			and direction.is_equal_approx(_candidate_direction) \
+			and tip_offset.is_equal_approx(_candidate_tip_offset) \
+			and is_equal_approx(power, _candidate_power) \
+			and cue_position.distance_squared_to(_candidate_cue_position) < AIM_EPSILON * AIM_EPSILON:
+		_settle_elapsed += delta
+	else:
+		_candidate_direction = direction
+		_candidate_tip_offset = tip_offset
+		_candidate_power = power
+		_candidate_cue_position = cue_position
+		_candidate_strike = strike
+		_has_candidate = true
+		_settle_elapsed = 0.0
+
+	if _settle_elapsed < AIM_SETTLE_DELAY:
 		return
 
-	_last_direction = direction
-	_last_tip_offset = tip_offset
-	_last_power = power
-	_last_cue_position = cue_position
+	_try_dispatch()
+
+
+## Starts a new prediction for the settled aim, unless one is already running
+## or it matches the last dispatch. Called once the aim has held still for
+## AIM_SETTLE_DELAY, and again right after a task finishes reaping in case
+## the aim had already settled while that calculation was running. At most
+## one task is ever in flight - Godot's WorkerThreadPool has no mid-run
+## cancellation - but debouncing on stability means fast continuous camera
+## movement never dispatches at all, so there's nothing to fall behind on;
+## a fresh, accurate trace only ever appears shortly after the player stops.
+func _try_dispatch() -> void:
+	if _task_in_flight or not _has_candidate:
+		return
+	if game.cue_ball == null or game.cue_ball.pocketed or not game.can_shoot():
+		return
+
+	if _has_last_prediction \
+			and _candidate_direction.is_equal_approx(_last_direction) \
+			and _candidate_tip_offset.is_equal_approx(_last_tip_offset) \
+			and is_equal_approx(_candidate_power, _last_power) \
+			and _candidate_cue_position.distance_squared_to(_last_cue_position) < AIM_EPSILON * AIM_EPSILON:
+		return
+
+	_last_direction = _candidate_direction
+	_last_tip_offset = _candidate_tip_offset
+	_last_power = _candidate_power
+	_last_cue_position = _candidate_cue_position
 	_has_last_prediction = true
 
-	_dispatch_prediction(strike, cue_position)
+	_dispatch_prediction(_candidate_strike, _candidate_cue_position)
 
 
 func _dispatch_prediction(strike: Dictionary, cue_position: Vector3) -> void:
@@ -196,8 +237,14 @@ func _reap_task_if_done() -> void:
 		return
 	if result.is_empty():
 		_clear()
-		return
-	_draw(result)
+	else:
+		_draw(result)
+
+	# The aim may have kept moving while that calculation ran. Re-check right
+	# away instead of waiting for the next throttled _process tick, so a
+	# continuously moving camera gets a continuously updated guide instead of
+	# falling further behind with every move.
+	_try_dispatch()
 
 
 func _style_line(mesh_instance: MeshInstance3D, color: Color) -> void:
@@ -283,10 +330,9 @@ func _ensure_shadow() -> void:
 		config["descriptors"] = descriptors
 	_shadow.configure(config)
 	# fixed_step/substeps are left at the class defaults, which match live
-	# gameplay (1/180s, 2 substeps) - now that prediction runs off the main
-	# thread there is no need to trade accuracy for frame time, and matching
-	# live resolution exactly avoids the coarse step missing fast cushion
-	# contacts or cutting a trace short before it reaches its target.
+	# gameplay (1/180s, 2 substeps) - this now runs off the main thread, and
+	# matching live resolution exactly avoids a coarser step missing fast
+	# cushion contacts or cutting a trace short before it reaches its target.
 	_shadow.ball_contacted.connect(_on_shadow_contact)
 	_shadow.ball_hit_cushion.connect(_on_shadow_cushion)
 	_shadow_ready = true

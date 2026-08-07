@@ -35,6 +35,8 @@ func _ready() -> void:
 	camera.fov = 55.0
 	birds_eye_camera.current = true
 	_place_birds_eye_camera()
+	if OS.get_name() == "Android":
+		_platform_sensitivity_scale = ANDROID_SENSITIVITY_SCALE
 
 
 ## Fixed top-down shot framing the whole table for the rolling-balls preview,
@@ -133,14 +135,20 @@ func _unhandled_input(event: InputEvent) -> void:
 ## no modifier key to hold), so the caller resets it after every shot.
 const YAW_SENSITIVITY: float = 0.008
 const PITCH_SENSITIVITY: float = 0.15
+# Touch drag on a phone screen covers far more pixels per gesture than a
+# mouse does, so the same raw sensitivity feels twitchy on Android. Scaled
+# down at the source rather than in the user-facing sensitivity setting, so
+# that setting's 0.5x-2.0x range still means the same thing on both platforms.
+const ANDROID_SENSITIVITY_SCALE: float = 0.55
 var precision_aim_factor: float = 0.2
 var precision_aim: bool = false
+var _platform_sensitivity_scale: float = 1.0
 
 func set_precision_aim(enabled: bool) -> void:
 	precision_aim = enabled
 
 func _apply_drag(delta: Vector2) -> void:
-	var factor: float = (precision_aim_factor if precision_aim else 1.0) * sensitivity_multiplier
+	var factor: float = (precision_aim_factor if precision_aim else 1.0) * sensitivity_multiplier * _platform_sensitivity_scale
 	yaw -= delta.x * YAW_SENSITIVITY * factor
 	pitch = clamp(pitch + delta.y * PITCH_SENSITIVITY * factor, min_pitch, max_pitch)
 
