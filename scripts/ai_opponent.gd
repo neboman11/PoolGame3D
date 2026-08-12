@@ -18,17 +18,14 @@ extends RefCounted
 ## gates whether such a candidate is even considered at all, which is what
 ## keeps Rookie from stumbling into a bank shot by luck of the draw.
 ##
-## Skilled difficulties (Pro/Champion) go further, when the caller supplies a
-## `shot_outcome` evaluator on the context (a callable(direction, power, hint)
-## -> Dictionary that actually simulates the shot to a rest and reads back the
-## table): they don't just pick the best pot, they weigh each candidate pot by
-## the shape it leaves for their own next shot (`_apply_shape_scoring`), and
-## when the best pot available is a low-percentage one they will gamble on
-## less often, they instead hunt for a legal safety that buries the cue ball
-## and leaves the opponent's next shot as bad as possible (`_defensive_plan`).
-## Without a `shot_outcome` evaluator on the context (e.g. the pure-geometry
-## unit tests), none of this activates and shot selection is exactly the
-## plain best-pot read described above.
+## When a caller provides a physics-backed `shot_outcome` evaluator, every
+## difficulty validates its leading candidate pots before choosing one. The search then
+## follows a bounded line of legal, turn-retaining shots: Rookie projects only
+## the present stroke; Amateur and Pro project one reply using direct routes;
+## Champion projects two replies and may retain bank/combo routes. The actual
+## table is re-evaluated after every live shot, so a predicted line is a plan,
+## never a script.
+
 
 enum Difficulty { ROOKIE, AMATEUR, PRO, CHAMPION }
 
@@ -40,6 +37,7 @@ const MAX_COS_CUT := 0.12
 ## geometry that is rarely makeable anyway.
 const MAX_BANK_RAILS := 2
 const BANK_SCORE_PENALTY := 16.0
+const OBJECT_BANK_SCORE_PENALTY := 14.0
 const COMBO_SCORE_PENALTY := 20.0
 ## A rail-facing pocket mouth interrupts the cushion nose -- a ball aimed at
 ## that stretch sails through into the pocket instead of bouncing. Bounce
@@ -55,6 +53,9 @@ const RISKY_SCORE_THRESHOLD := 45.0
 ## in the shape they leave. Kept small: this is a real physics sim per entry.
 const SHAPE_CANDIDATE_LIMIT := 5
 const SHAPE_SCRATCH_LEAVE_SCORE := -60.0
+const PLANNING_SCORE_DISCOUNT := 0.62
+const MAX_OPPONENT_REPLY_SCORE := 180.0
+const FAILED_POT_DISQUALIFY_PENALTY := 500.0
 ## A scratch is a foul, not just a mediocre leave -- shape-scoring subtracts
 ## this flat, weight-independent penalty on top of the normal leave-score
 ## math so a scratching candidate essentially never outranks a clean one,
@@ -71,16 +72,17 @@ const SCRATCH_DISQUALIFY_PENALTY := 500.0
 ## win on shape when its raw score is close to the leader's, but not when a
 ## clean pot is comfortably better.
 const ADVANCED_SHOT_SHAPE_WEIGHT_SCALE := 0.2
+const BANK_SPIN_SCALE := 0.35
 ## Legal balls considered as a safety's contact ball, nearest first.
 const DEFENSE_BALL_COUNT := 2
 const DEFENSE_AIM_SPREAD_DEG := [-10.0, -5.0, 0.0, 5.0, 10.0]
 const DEFENSE_POWER := 0.3
 
 const PARAMS := {
-	Difficulty.ROOKIE: {"label": "Rookie", "aim_error_deg": 7.5, "power_error": 0.22, "pool_size": 4, "bank_chance": 0.04, "plans_shape": false, "shape_weight": 0.0, "safety_skill": 0.0},
-	Difficulty.AMATEUR: {"label": "Amateur", "aim_error_deg": 3.5, "power_error": 0.12, "pool_size": 3, "bank_chance": 0.22, "plans_shape": false, "shape_weight": 0.0, "safety_skill": 0.12},
-	Difficulty.PRO: {"label": "Pro", "aim_error_deg": 1.2, "power_error": 0.06, "pool_size": 2, "bank_chance": 0.55, "plans_shape": true, "shape_weight": 0.5, "safety_skill": 0.4},
-	Difficulty.CHAMPION: {"label": "Champion", "aim_error_deg": 0.25, "power_error": 0.02, "pool_size": 1, "bank_chance": 0.9, "plans_shape": true, "shape_weight": 0.85, "safety_skill": 0.75},
+	Difficulty.ROOKIE: {"label": "Rookie", "aim_error_deg": 7.5, "power_error": 0.22, "pool_size": 4, "bank_chance": 0.04, "shape_weight": 0.12, "opponent_reply_weight": 0.0, "planning_depth": 1, "planning_candidates": 3, "planning_advanced_candidates": 0, "planning_width": 1, "planning_advanced": false, "safety_skill": 0.0, "spin_chance": 0.08, "spin_strength": 0.25, "side_spin_chance": 0.10},
+	Difficulty.AMATEUR: {"label": "Amateur", "aim_error_deg": 3.5, "power_error": 0.12, "pool_size": 3, "bank_chance": 0.22, "shape_weight": 0.28, "opponent_reply_weight": 0.12, "planning_depth": 2, "planning_candidates": 3, "planning_advanced_candidates": 0, "planning_width": 1, "planning_advanced": false, "safety_skill": 0.12, "spin_chance": 0.25, "spin_strength": 0.35, "side_spin_chance": 0.20},
+	Difficulty.PRO: {"label": "Pro", "aim_error_deg": 1.2, "power_error": 0.06, "pool_size": 2, "bank_chance": 0.55, "shape_weight": 0.58, "opponent_reply_weight": 0.42, "planning_depth": 2, "planning_candidates": 3, "planning_advanced_candidates": 1, "planning_width": 2, "planning_advanced": false, "safety_skill": 0.4, "spin_chance": 0.52, "spin_strength": 0.48, "side_spin_chance": 0.35},
+	Difficulty.CHAMPION: {"label": "Champion", "aim_error_deg": 0.25, "power_error": 0.02, "pool_size": 1, "bank_chance": 1.0, "shape_weight": 0.9, "opponent_reply_weight": 0.7, "planning_depth": 3, "planning_candidates": 3, "planning_advanced_candidates": 2, "planning_width": 2, "planning_advanced": true, "safety_skill": 0.75, "spin_chance": 0.80, "spin_strength": 0.62, "side_spin_chance": 0.50},
 }
 
 
@@ -100,7 +102,7 @@ static func plan_shot(context: Dictionary) -> Dictionary:
 
 	if candidates.is_empty():
 		if has_outcome_evaluator:
-			var fallback: Variant = _defensive_plan(context)
+			var fallback: Variant = _defensive_plan(context, params, rng)
 			if fallback != null:
 				return _finalize_plan(fallback, params, rng, context)
 		return _safety_plan(context)
@@ -108,14 +110,19 @@ static func plan_shot(context: Dictionary) -> Dictionary:
 	# A skilled player who reads the table and sees only a low-percentage pot
 	# will often play safe instead of gambling on it, rather than firing at
 	# the best of a bad set of options.
-	if has_outcome_evaluator and candidates[0]["score"] < RISKY_SCORE_THRESHOLD:
+	if has_outcome_evaluator and int(params.get("planning_depth", 1)) <= 1 and candidates[0]["score"] < RISKY_SCORE_THRESHOLD:
 		if rng.randf() < float(params.get("safety_skill", 0.0)):
-			var defensive: Variant = _defensive_plan(context)
+			var defensive: Variant = _defensive_plan(context, params, rng)
 			if defensive != null:
 				return _finalize_plan(defensive, params, rng, context)
 
-	if has_outcome_evaluator and bool(params.get("plans_shape", false)):
-		candidates = _apply_shape_scoring(candidates, context, float(params.get("shape_weight", 0.0)))
+	if has_outcome_evaluator:
+		candidates = _apply_sequence_scoring(candidates, context, params, rng)
+		if candidates.is_empty():
+			var defensive: Variant = _defensive_plan(context, params, rng)
+			if defensive != null:
+				return _finalize_plan(defensive, params, rng, context)
+			return _safety_plan(context)
 
 	var pool_size: int = mini(int(params["pool_size"]), candidates.size())
 	var choice: Dictionary = candidates[rng.randi_range(0, pool_size - 1)]
@@ -140,39 +147,56 @@ static func _estimate_base_power(choice: Dictionary, context: Dictionary) -> flo
 ## Difficulty's aim/power jitter and bank-refiner correction, shared by every
 ## plan_shot return path (plain pot, bank, combo, or a defensive safety).
 static func _finalize_plan(choice: Dictionary, params: Dictionary, rng: RandomNumberGenerator, context: Dictionary) -> Dictionary:
-	var base_power: float = float(choice["power"]) if choice.has("power") else _estimate_base_power(choice, context)
-
-	# Bank geometry here is an idealized mirror reflection; real cushion
-	# friction throws the rebound off that ideal angle. A caller with a real
-	# physics solver on hand (the live game) can supply a "bank_refiner"
-	# callable(choice, power) -> Vector3 that corrects the pre-jitter aim
-	# against that solver before difficulty noise is layered on top. Callers
-	# without one (e.g. tests) get the pure geometric read unchanged.
-	var ideal_direction: Vector3 = choice["direction"]
-	if choice.get("is_bank", false) and context.has("bank_refiner"):
-		var refiner: Callable = context["bank_refiner"]
-		var refined: Variant = refiner.call(choice, base_power)
-		if refined is Vector3 and refined != Vector3.ZERO:
-			ideal_direction = refined
-
-	var aim_error_deg: float = params["aim_error_deg"]
-	var jitter_deg := clampf(rng.randfn(0.0, aim_error_deg * 0.5), -aim_error_deg * 2.0, aim_error_deg * 2.0)
-	var noisy_direction: Vector3 = ideal_direction.rotated(Vector3.UP, deg_to_rad(jitter_deg))
-
-	var power_error: float = params["power_error"]
-	var noisy_power := clampf(base_power + rng.randfn(0.0, power_error), 0.18, 1.0)
-
+	var prepared_choice := _prepare_delivery(choice, params, rng)
+	var delivery := _delivered_shot(prepared_choice, context)
 	return {
-		"direction": noisy_direction,
-		"power": noisy_power,
+		"direction": delivery["direction"],
+		"power": delivery["power"],
+		"spin_offset": prepared_choice["spin_offset"],
 		"target_ball": choice["target_ball"],
 		"pocket_id": choice.get("pocket_id", ""),
 		"cut_angle_deg": choice.get("cut_angle_deg", 0.0),
 		"is_safety": choice.get("is_safety", false),
 		"is_bank": choice.get("is_bank", false),
+		"is_object_bank": choice.get("is_object_bank", false),
 		"rails": choice.get("rails", 0),
 		"is_combo": choice.get("is_combo", false),
 		"assist_ball": choice.get("assist_ball", -1),
+	}
+
+
+## Stores the exact execution noise before a candidate is scored. The final
+## stroke reuses it, so a tight bank is never approved as a perfect center-ball
+## shot and then missed by a different post-selection random error.
+static func _prepare_delivery(choice: Dictionary, params: Dictionary, rng: RandomNumberGenerator) -> Dictionary:
+	var prepared: Dictionary = choice.duplicate(true)
+	if not prepared.has("spin_offset"):
+		prepared["spin_offset"] = _select_spin_offset(prepared, params, rng)
+	if not prepared.has("aim_jitter_deg"):
+		var aim_error_deg: float = params["aim_error_deg"]
+		prepared["aim_jitter_deg"] = clampf(rng.randfn(0.0, aim_error_deg * 0.5), -aim_error_deg * 2.0, aim_error_deg * 2.0)
+	if not prepared.has("power_jitter"):
+		prepared["power_jitter"] = rng.randfn(0.0, float(params["power_error"]))
+	return prepared
+
+
+static func _delivered_shot(choice: Dictionary, context: Dictionary) -> Dictionary:
+	var base_power: float = float(choice["power"]) if choice.has("power") else _estimate_base_power(choice, context)
+	var power := clampf(base_power + float(choice.get("power_jitter", 0.0)), 0.18, 1.0)
+	var ideal_direction := _ideal_direction(choice, context, power)
+	if choice.get("is_object_bank", false) and context.has("object_bank_refiner"):
+		var refiner: Callable = context["object_bank_refiner"]
+		var refined: Variant = refiner.call(choice, power)
+		if refined is Dictionary:
+			# An unsuccessful physical refinement returns an empty Dictionary.
+			# Read the optional value once; never index it after a failed search.
+			var refined_direction: Variant = refined.get("direction", null)
+			if refined_direction is Vector3 and refined_direction != Vector3.ZERO:
+				ideal_direction = refined_direction
+			power = clampf(float(refined.get("power", power)), 0.18, 1.0)
+	return {
+		"direction": ideal_direction.rotated(Vector3.UP, deg_to_rad(float(choice.get("aim_jitter_deg", 0.0)))),
+		"power": power,
 	}
 
 
@@ -182,30 +206,193 @@ static func _finalize_plan(choice: Dictionary, params: Dictionary, rng: RandomNu
 ## comes to rest. A candidate that scratches is treated as the worst possible
 ## leave rather than dropped outright -- it still might be the only shot on
 ## the table, and `_finalize_plan` still applies to whatever wins.
-static func _apply_shape_scoring(candidates: Array[Dictionary], context: Dictionary, shape_weight: float) -> Array[Dictionary]:
-	if shape_weight <= 0.0 or candidates.is_empty():
+## Picks a conservative english offset for position play. Draw holds the cue
+## ball on safeties and larger cuts; follow is preferred on easier, straighter
+## pots. Side english is deliberately lighter because it changes the cue-ball
+## approach line as well as its post-contact route.
+static func _select_spin_offset(choice: Dictionary, params: Dictionary, rng: RandomNumberGenerator) -> Vector2:
+	if rng.randf() >= float(params.get("spin_chance", 0.0)):
+		return Vector2.ZERO
+
+	var strength := float(params.get("spin_strength", 0.0)) * rng.randf_range(0.6, 1.0)
+	var is_safety := bool(choice.get("is_safety", false))
+	var uses_draw := is_safety or float(choice.get("cut_angle_deg", 0.0)) >= 30.0
+	var top_back := -strength if uses_draw else strength
+	var english := 0.0
+	if not is_safety and rng.randf() < float(params.get("side_spin_chance", 0.0)):
+		english = rng.randf_range(-strength, strength) * 0.45
+	var spin := Vector2(english, top_back)
+	# Cushion routes are already calibrated in the shadow solver; large english
+	# changes rebound throw enough to invalidate that calibration. They still get
+	# a small, difficulty-scaled amount of spin for character and position play.
+	if bool(choice.get("is_bank", false)) or bool(choice.get("is_object_bank", false)):
+		spin *= BANK_SPIN_SCALE
+	return spin
+
+
+## Uses physics-validated outcomes as a bounded beam search. The score is a
+## line of makeable pots, not just where the cue ball happened to stop after
+## the first one. This deliberately stays narrow so AI turns stay responsive.
+static func _apply_sequence_scoring(candidates: Array[Dictionary], context: Dictionary, params: Dictionary, rng: RandomNumberGenerator) -> Array[Dictionary]:
+	if candidates.is_empty():
 		return candidates
+
+	var root_limit: int = mini(int(params.get("planning_candidates", SHAPE_CANDIDATE_LIMIT)), candidates.size())
+	var advanced_limit: int = int(params.get("planning_advanced_candidates", 0))
+	var depth: int = maxi(int(params.get("planning_depth", 1)), 1)
+	var width: int = maxi(int(params.get("planning_width", 1)), 1)
+	var allow_advanced: bool = bool(params.get("planning_advanced", false))
+	var selected_indices: Dictionary = {}
+	var scored: Array[Dictionary] = []
+
+	# Keep the strongest raw pots, then reserve a few physics-validation slots
+	# for each advanced family. Flat geometry penalties must not hide the one
+	# bank or combo that creates the winning line.
+	for index in range(root_limit):
+		var choice: Dictionary = _prepare_delivery(candidates[index], params, rng)
+		choice["shape_score"] = _score_sequence(choice, context, params, depth, width, allow_advanced, rng)
+		selected_indices[index] = true
+		scored.append(choice)
+
+	var advanced_count := 0
+	for index in range(candidates.size()):
+		if advanced_count >= advanced_limit:
+			break
+		if selected_indices.has(index) or not _is_advanced_choice(candidates[index]):
+			continue
+		var advanced_choice: Dictionary = _prepare_delivery(candidates[index], params, rng)
+		advanced_choice["shape_score"] = _score_sequence(advanced_choice, context, params, depth, width, allow_advanced, rng)
+		selected_indices[index] = true
+		scored.append(advanced_choice)
+		advanced_count += 1
+
+	scored.sort_custom(func(a, b): return float(a["shape_score"]) > float(b["shape_score"]))
+	if not scored.is_empty() and float(scored[0]["shape_score"]) > 0.0:
+		return scored
+
+	return []
+
+	# If every validated route misses or fouls, restore the raw tail as a
+	# last-resort escape hatch rather than attempting a known-bad shot.
+	for index in range(candidates.size()):
+		if selected_indices.has(index):
+			continue
+		var fallback: Dictionary = _prepare_delivery(candidates[index], params, rng)
+		fallback["shape_score"] = float(fallback["score"])
+		scored.append(fallback)
+	scored.sort_custom(func(a, b): return float(a["shape_score"]) > float(b["shape_score"]))
+	return scored
+
+
+static func _is_advanced_choice(choice: Dictionary) -> bool:
+	return bool(choice.get("is_bank", false)) or bool(choice.get("is_object_bank", false)) or bool(choice.get("is_combo", false))
+
+
+static func _score_sequence(choice: Dictionary, context: Dictionary, params: Dictionary, depth: int, width: int, allow_advanced: bool, rng: RandomNumberGenerator) -> float:
+	var raw_score: float = float(choice["score"])
+	var outcome: Variant = _simulate_choice(choice, context)
+	if not (outcome is Dictionary):
+		return raw_score - FAILED_POT_DISQUALIFY_PENALTY
+	if bool(outcome.get("scratched", false)):
+		return raw_score - SCRATCH_DISQUALIFY_PENALTY
+	if bool(outcome.get("foul", false)):
+		return raw_score - FAILED_POT_DISQUALIFY_PENALTY
+	if not _first_contact_is_legal(outcome, context):
+		return raw_score - FAILED_POT_DISQUALIFY_PENALTY
+
+	var position_value := _position_value(choice, outcome, float(params.get("shape_weight", 0.0)))
+	if not _choice_was_pocketed(choice, outcome):
+		return raw_score + position_value - FAILED_POT_DISQUALIFY_PENALTY
+	if not bool(outcome.get("continues", true)):
+		return raw_score + position_value - _opponent_reply_penalty(outcome, params)
+	if depth <= 1:
+		return raw_score + position_value
+
+	var next_context: Variant = _continuation_context(context, outcome, allow_advanced)
+	if not (next_context is Dictionary):
+		return raw_score + position_value
+	var next_candidates := rank_candidates(next_context)
+	if next_candidates.is_empty():
+		return raw_score + position_value
+
+	var next_limit: int = mini(width, next_candidates.size())
+	var best_follow_up := -INF
+	for index in range(next_limit):
+		var follow_up: Dictionary = _prepare_delivery(next_candidates[index], params, rng)
+		best_follow_up = maxf(best_follow_up, _score_sequence(follow_up, next_context, params, depth - 1, width, allow_advanced, rng))
+	return raw_score + position_value + best_follow_up * PLANNING_SCORE_DISCOUNT
+
+
+## A dry turn should leave the opponent as little as possible. The controller
+## supplies this score from the resulting shadow table; callers without physics
+## simply omit it and retain geometry-only behavior.
+static func _opponent_reply_penalty(outcome: Dictionary, params: Dictionary) -> float:
+	var opponent_score := clampf(float(outcome.get("opponent_score", 0.0)), 0.0, MAX_OPPONENT_REPLY_SCORE)
+	return opponent_score * float(params.get("opponent_reply_weight", 0.0))
+
+
+static func _simulate_choice(choice: Dictionary, context: Dictionary) -> Variant:
 	var evaluator: Callable = context["shot_outcome"]
-	var limit: int = mini(SHAPE_CANDIDATE_LIMIT, candidates.size())
-	for i in range(limit):
-		var choice: Dictionary = candidates[i]
-		var power: float = _estimate_base_power(choice, context)
-		var outcome: Variant = evaluator.call(choice["direction"], power, {"is_bank": choice.get("is_bank", false)})
-		if outcome is Dictionary and bool(outcome.get("scratched", false)):
-			choice["shape_score"] = float(choice["score"]) - SCRATCH_DISQUALIFY_PENALTY
-		else:
-			var leave_score := SHAPE_SCRATCH_LEAVE_SCORE
-			if outcome is Dictionary:
-				leave_score = float(outcome.get("own_leave_score", SHAPE_SCRATCH_LEAVE_SCORE))
-			var effective_weight := shape_weight
-			if choice.get("is_bank", false) or choice.get("is_combo", false):
-				effective_weight *= ADVANCED_SHOT_SHAPE_WEIGHT_SCALE
-			choice["shape_score"] = float(choice["score"]) + effective_weight * leave_score
-		candidates[i] = choice
-	candidates.sort_custom(func(a, b): return float(a.get("shape_score", a["score"])) > float(b.get("shape_score", b["score"])))
-	return candidates
+	var delivery := _delivered_shot(choice, context)
+	return evaluator.call(delivery["direction"], delivery["power"], {
+		"target_ball": choice.get("target_ball", -1),
+		"pocket_id": choice.get("pocket_id", ""),
+		"is_bank": choice.get("is_bank", false),
+		"is_object_bank": choice.get("is_object_bank", false),
+		"is_combo": choice.get("is_combo", false),
+		"assist_ball": choice.get("assist_ball", -1),
+		"spin_offset": choice.get("spin_offset", Vector2.ZERO),
+	})
 
 
+static func _ideal_direction(choice: Dictionary, context: Dictionary, power: float) -> Vector3:
+	var ideal_direction: Vector3 = choice["direction"]
+	if not choice.get("is_bank", false) or not context.has("bank_refiner"):
+		return ideal_direction
+	var refiner: Callable = context["bank_refiner"]
+	var refined: Variant = refiner.call(choice, power)
+	return refined if refined is Vector3 and refined != Vector3.ZERO else ideal_direction
+
+
+static func _choice_was_pocketed(choice: Dictionary, outcome: Dictionary) -> bool:
+	# Test-only evaluators written before pocket feedback existed do not expose
+	# `pocketed`; retain their prior shape-scoring behavior.
+	if not outcome.has("pocketed"):
+		return true
+	var pocketed: Array = outcome["pocketed"]
+	var intended_ball: int = int(choice.get("assist_ball", choice.get("target_ball", -1))) if choice.get("is_combo", false) else int(choice.get("target_ball", -1))
+	return intended_ball in pocketed
+
+
+static func _first_contact_is_legal(outcome: Dictionary, context: Dictionary) -> bool:
+	# Minimal test evaluators may omit contact telemetry. The live evaluator
+	# always provides it, where an illegal first hit must end the line.
+	if not outcome.has("first_contact"):
+		return true
+	return int(outcome["first_contact"]) in context["legal_numbers"]
+
+
+static func _position_value(choice: Dictionary, outcome: Dictionary, shape_weight: float) -> float:
+	var leave_score := float(outcome.get("own_leave_score", SHAPE_SCRATCH_LEAVE_SCORE))
+	if is_inf(leave_score) or is_nan(leave_score):
+		leave_score = SHAPE_SCRATCH_LEAVE_SCORE
+	var effective_weight := shape_weight
+	if choice.get("is_bank", false) or choice.get("is_object_bank", false) or choice.get("is_combo", false):
+		effective_weight *= ADVANCED_SHOT_SHAPE_WEIGHT_SCALE
+	return effective_weight * leave_score
+
+
+static func _continuation_context(context: Dictionary, outcome: Dictionary, allow_advanced: bool) -> Variant:
+	if not context.has("continuation_context"):
+		return null
+	var builder: Callable = context["continuation_context"]
+	var next: Variant = builder.call(outcome)
+	if not (next is Dictionary):
+		return null
+	var next_context: Dictionary = next.duplicate(true)
+	next_context["allow_advanced_shots"] = allow_advanced
+	next_context.erase("rng")
+	return next_context
 ## Hunts for the legal contact ball / cut angle that leaves the *opponent*
 ## with the worst follow-up shot, using the same `shot_outcome` evaluator as
 ## `_apply_shape_scoring`. Unlike `_safety_plan`'s dead-on tap (used only when
@@ -213,20 +400,19 @@ static func _apply_shape_scoring(candidates: Array[Dictionary], context: Diction
 ## and picks the option that buries it best. Returns null -- letting the
 ## caller fall back to `_safety_plan` -- when nothing legal was found (e.g.
 ## every legal ball would scratch or foul).
-static func _defensive_plan(context: Dictionary) -> Variant:
+static func _defensive_plan(context: Dictionary, params: Dictionary, rng: RandomNumberGenerator) -> Variant:
 	var cue_position: Vector3 = context["cue_position"]
 	var legal_numbers: Array = context["legal_numbers"]
 	var evaluator: Callable = context["shot_outcome"]
-
 	var legal_balls: Array = []
 	for ball_info in context["balls"]:
 		if ball_info["number"] in legal_numbers:
 			legal_balls.append(ball_info)
 	if legal_balls.is_empty():
 		return null
+
 	legal_balls.sort_custom(func(a, b): return cue_position.distance_squared_to(a["position"]) < cue_position.distance_squared_to(b["position"]))
 	legal_balls = legal_balls.slice(0, mini(DEFENSE_BALL_COUNT, legal_balls.size()))
-
 	var best: Variant = null
 	var best_opponent_score := INF
 	for ball_info in legal_balls:
@@ -237,31 +423,35 @@ static func _defensive_plan(context: Dictionary) -> Variant:
 		var base_direction := to_ball.normalized()
 		for angle_deg in DEFENSE_AIM_SPREAD_DEG:
 			var direction: Vector3 = base_direction.rotated(Vector3.UP, deg_to_rad(angle_deg))
-			var outcome: Variant = evaluator.call(direction, DEFENSE_POWER, {"is_defense": true})
-			if not (outcome is Dictionary) or bool(outcome.get("scratched", false)):
+			var candidate := {
+				"direction": direction,
+				"power": DEFENSE_POWER,
+				"target_ball": int(ball_info["number"]),
+				"pocket_id": "",
+				"cut_angle_deg": 0.0,
+				"is_bank": false,
+				"rails": 0,
+				"is_combo": false,
+				"is_safety": true,
+				"assist_ball": -1,
+			}
+			candidate = _prepare_delivery(candidate, params, rng)
+			var delivery := _delivered_shot(candidate, context)
+			var outcome: Variant = evaluator.call(delivery["direction"], delivery["power"], {
+				"is_defense": true,
+				"spin_offset": candidate["spin_offset"],
+			})
+			if not (outcome is Dictionary) or bool(outcome.get("scratched", false)) or bool(outcome.get("foul", false)):
 				continue
 			if int(outcome.get("first_contact", -1)) not in legal_numbers:
 				continue
 			var opponent_score: float = float(outcome.get("opponent_score", INF))
 			if opponent_score < best_opponent_score:
 				best_opponent_score = opponent_score
-				best = {
-					"direction": direction,
-					"power": DEFENSE_POWER,
-					"target_ball": int(ball_info["number"]),
-					"pocket_id": "",
-					"cut_angle_deg": 0.0,
-					"is_bank": false,
-					"is_combo": false,
-					"is_safety": true,
-					"assist_ball": -1,
-				}
+				best = candidate
 	return best
 
 
-## Best achievable shot quality from a hypothetical cue-ball position,
-## ignoring difficulty entirely. Ball-in-hand placement uses this to compare
-## candidate spots without also asking "how well would a Rookie play it".
 static func best_score(context: Dictionary) -> float:
 	var candidates := rank_candidates(context)
 	return candidates[0]["score"] if not candidates.is_empty() else -INF
@@ -276,6 +466,7 @@ static func rank_candidates(context: Dictionary) -> Array[Dictionary]:
 	var balls: Array = context["balls"]
 	var pockets: Array = context["pockets"]
 	var legal_numbers: Array = context["legal_numbers"]
+	var combo_assist_numbers: Array = context.get("combo_assist_numbers", legal_numbers)
 	var bounds: Variant = context.get("table_bounds")
 	var rng: Variant = context.get("rng")
 	var difficulty: int = context.get("difficulty", Difficulty.AMATEUR)
@@ -300,10 +491,14 @@ static func rank_candidates(context: Dictionary) -> Array[Dictionary]:
 				var bank: Variant = _evaluate_bank_pot(cue_position, ball_position, number, pocket, balls, bounds, pockets)
 				if bank != null:
 					candidates.append(bank)
+			if allow_advanced and _advanced_shot_allowed(rng, bank_chance):
+				var object_bank: Variant = _evaluate_object_bank_pot(cue_position, ball_position, number, pocket, balls, bounds, pockets)
+				if object_bank != null:
+					candidates.append(object_bank)
 
 			for assist_info in balls:
 				var assist_number: int = assist_info["number"]
-				if assist_number == number or assist_number not in legal_numbers:
+				if assist_number == number or assist_number not in combo_assist_numbers:
 					continue
 				if allow_advanced and _advanced_shot_allowed(rng, bank_chance):
 					var combo: Variant = _evaluate_combo_pot(cue_position, ball_info, assist_info, pocket, balls)
@@ -505,6 +700,60 @@ static func _evaluate_bank_pot(cue_position: Vector3, ball_position: Vector3, ba
 ## table's cushion restitution on hand (the live game) uses this per-bounce
 ## to work out how much launch speed a bank shot loses to the rail(s) that a
 ## rolling-friction-only distance model can't see.
+## A true bank shot: the cue ball reaches the legal object ball directly,
+## then that object ball uses one cushion on its way to the pocket. This is
+## distinct from the cue-ball kick evaluated by _evaluate_bank_pot().
+## One rail is deliberately supported here; longer object-ball banks are too
+## sensitive to cushion throw to be trustworthy without a separate solver.
+static func _evaluate_object_bank_pot(cue_position: Vector3, ball_position: Vector3, ball_number: int, pocket: Dictionary, all_balls: Array, bounds: Variant, all_pockets: Array) -> Variant:
+	if bounds == null:
+		return null
+	var pocket_target: Vector3 = pocket["position"] + Vector3(pocket["inward_normal"]).normalized() * (float(pocket["mouth_width"]) * 0.22)
+	var obstacles: Array = _obstacle_positions(all_balls, [ball_number])
+	var best: Variant = null
+	for wall_set in _bank_wall_sets(bounds):
+		if wall_set.size() != 1:
+			continue
+		var bounce_points: Variant = _unfold_bank_path(ball_position, pocket_target, wall_set, bounds, all_pockets)
+		if bounce_points == null:
+			continue
+		var to_bounce: Vector3 = bounce_points[0] - ball_position
+		to_bounce.y = 0.0
+		if to_bounce.length_squared() < 0.000001:
+			continue
+		var pot_direction := to_bounce.normalized()
+		var ghost_position := ball_position - pot_direction * CONTACT_DISTANCE
+		var approach: Variant = _approach(cue_position, ghost_position, pot_direction)
+		if approach == null:
+			continue
+		if _path_blocked(cue_position, ghost_position, obstacles):
+			continue
+		if _bank_path_blocked(ball_position, bounce_points, pocket_target, obstacles):
+			continue
+
+		var pot_distance: float = _bank_path_length(ball_position, bounce_points, pocket_target)
+		var travel_distance: float = approach["approach_distance"] + pot_distance
+		var score: float = 100.0 - approach["cut_angle_deg"] * 0.85 - travel_distance * 2.6 - OBJECT_BANK_SCORE_PENALTY
+		if best == null or score > best["score"]:
+			best = {
+				"target_ball": ball_number,
+				"pocket_id": pocket["id"],
+				"direction": approach["approach_direction"],
+				"cut_angle_deg": approach["cut_angle_deg"],
+				"travel_distance": travel_distance,
+				"approach_distance": approach["approach_distance"],
+				"pot_distance": pot_distance,
+				"score": score,
+				"is_bank": false,
+				"is_object_bank": true,
+				"rails": 1,
+				"is_combo": false,
+				"assist_ball": -1,
+				"bank_incidence_degrees": _bank_incidence_degrees(ball_position, bounce_points, wall_set),
+			}
+	return best
+
+
 static func _bank_incidence_degrees(cue_position: Vector3, bounce_points: Array, wall_set: Array) -> Array[float]:
 	var incidences: Array[float] = []
 	var previous_point := cue_position

@@ -21,12 +21,22 @@ var _failed: Array[String] = []
 func run() -> int:
 	_run_case("power press locks aim before drag", _test_power_press_locks_aim)
 	_run_case("power drag locks aim until cancellation", _test_power_drag_locks_aim)
+	_run_case("AI exact lock preserves planned aim", _test_ai_exact_lock_preserves_aim)
 	_run_case("spin drag locks aim until released", _test_spin_drag_locks_aim)
 	_run_case("successful stroke clears selected spin", _test_successful_stroke_clears_spin)
 	_run_case("ready state restores aim control", _test_ready_state_restores_aim_control)
 	_run_case("cue state gates camera input", _test_cue_state_gates_camera_input)
 	_run_case("camera lock clears active orbit gesture", _test_camera_lock_clears_active_gesture)
 	_run_case("cue fades after strike hold", _test_post_strike_fade)
+	_run_case("sub-threshold power is rejected and returns to ready", _test_low_power_rejected)
+	_run_case("a missing cue ball rejects the stroke", _test_null_cue_ball_rejected)
+	_run_case("a pocketed cue ball rejects the stroke", _test_pocketed_cue_ball_rejected)
+	_run_case("a second spin press is rejected while one is active", _test_spin_input_rejects_double_begin)
+	_run_case("a spin press is rejected while powering", _test_spin_input_rejects_during_power)
+	_run_case("cue/ball speed-for-power is monotonic and round-trips through its inverse", _test_speed_power_round_trip)
+	_run_case("power-for-speed clamps outside the cue's speed range", _test_power_for_speed_clamps)
+	_run_case("elevation is clamped to 0..60 degrees", _test_elevation_clamped)
+	_run_case("elevation tilts the strike direction upward", _test_elevated_strike_direction)
 	if _failed.is_empty():
 		print("PASS: %d cue input state checks" % _passed)
 		return 0
@@ -75,6 +85,18 @@ func _test_power_drag_locks_aim() -> String:
 	if cue.input_phase != cue.InputPhase.READY:
 		return _free_cue(cue, "cancelling power drag did not return READY")
 	return _free_cue(cue, "")
+
+
+func _test_ai_exact_lock_preserves_aim() -> String:
+	var cue: Node3D = CUE_STICK.new()
+	var planned_aim := Vector3(0.4, 0.0, 0.9).normalized()
+	cue.aim_direction = planned_aim
+	cue._ai_exact_aim_lock = true
+	cue._lock_aim()
+	var error := ""
+	if not cue._locked_aim_direction.is_equal_approx(planned_aim):
+		error = "AI exact aim lock added an unplanned stroke jitter"
+	return _free_cue(cue, error)
 
 
 func _test_spin_drag_locks_aim() -> String:
@@ -207,6 +229,126 @@ func _test_post_strike_fade() -> String:
 	if cue.visible:
 		return _free_cue(cue, "cue remained visible after the fade completed")
 	return _free_cue(cue, "")
+
+
+func _test_low_power_rejected() -> String:
+	var cue: Node3D = CUE_STICK.new()
+	var cue_ball: RigidBody3D = BALL_SCENE.instantiate()
+	cue_ball.mass = 0.17
+	cue.cue_ball = cue_ball
+	var physics_world := PhysicsWorldStub.new()
+	var error := ""
+	if cue.take_shot(0.02, physics_world):
+		error = "a stroke below the power threshold should be rejected"
+	if error.is_empty() and physics_world.was_struck:
+		error = "a rejected sub-threshold stroke must not reach the physics world"
+	if error.is_empty() and cue.input_phase != cue.InputPhase.READY:
+		error = "a rejected stroke should leave the cue READY"
+	cue_ball.free()
+	physics_world.free()
+	return _free_cue(cue, error)
+
+
+func _test_null_cue_ball_rejected() -> String:
+	var cue: Node3D = CUE_STICK.new()
+	var physics_world := PhysicsWorldStub.new()
+	var error := ""
+	if cue.take_shot(0.6, physics_world):
+		error = "a stroke with no cue ball assigned should be rejected"
+	if error.is_empty() and physics_world.was_struck:
+		error = "a rejected stroke must not reach the physics world"
+	physics_world.free()
+	return _free_cue(cue, error)
+
+
+func _test_pocketed_cue_ball_rejected() -> String:
+	var cue: Node3D = CUE_STICK.new()
+	var cue_ball: RigidBody3D = BALL_SCENE.instantiate()
+	cue_ball.mass = 0.17
+	cue_ball.pocketed = true
+	cue.cue_ball = cue_ball
+	var physics_world := PhysicsWorldStub.new()
+	var error := ""
+	if cue.take_shot(0.6, physics_world):
+		error = "a stroke on an already-pocketed cue ball should be rejected"
+	if error.is_empty() and physics_world.was_struck:
+		error = "a rejected stroke must not reach the physics world"
+	cue_ball.free()
+	physics_world.free()
+	return _free_cue(cue, error)
+
+
+func _test_spin_input_rejects_double_begin() -> String:
+	var cue: Node3D = CUE_STICK.new()
+	var error := ""
+	if not cue.begin_spin_input():
+		error = "the first spin press should be accepted while READY"
+	if error.is_empty() and cue.begin_spin_input():
+		error = "a second spin press while one is already active must be rejected"
+	return _free_cue(cue, error)
+
+
+func _test_spin_input_rejects_during_power() -> String:
+	var cue: Node3D = CUE_STICK.new()
+	cue.begin_power_input()
+	var error := ""
+	if cue.begin_spin_input():
+		error = "a spin press while powering must be rejected"
+	return _free_cue(cue, error)
+
+
+func _test_speed_power_round_trip() -> String:
+	var error := ""
+	var previous_speed := -1.0
+	for power in [0.0, 0.25, 0.5, 0.75, 1.0]:
+		var cue_speed: float = CUE_STICK.cue_speed_mps_for_power(power)
+		if cue_speed <= previous_speed:
+			error = "cue speed for power %.2f (%.4f) did not increase over the prior power" % [power, cue_speed]
+			break
+		previous_speed = cue_speed
+		var launch_speed: float = CUE_STICK.cue_ball_speed_mps_for_power(power)
+		var recovered_power: float = CUE_STICK.power_for_cue_ball_speed_mps(launch_speed)
+		if absf(recovered_power - power) > 0.0005:
+			error = "power_for_cue_ball_speed_mps(%.4f) = %.4f; expected %.2f" % [launch_speed, recovered_power, power]
+			break
+	return error
+
+
+func _test_power_for_speed_clamps() -> String:
+	var error := ""
+	if not is_equal_approx(CUE_STICK.power_for_cue_ball_speed_mps(0.0), 0.0):
+		error = "a speed at or below the minimum should map to power 0"
+	if error.is_empty() and not is_equal_approx(CUE_STICK.power_for_cue_ball_speed_mps(100.0), 1.0):
+		error = "a speed far above the cue's maximum should clamp to power 1"
+	return error
+
+
+func _test_elevation_clamped() -> String:
+	var cue: Node3D = CUE_STICK.new()
+	cue.set_elevation(-10.0)
+	var error := ""
+	if not is_equal_approx(cue.cue_elevation_degrees, 0.0):
+		error = "negative elevation should clamp to 0"
+	cue.set_elevation(90.0)
+	if error.is_empty() and not is_equal_approx(cue.cue_elevation_degrees, 60.0):
+		error = "elevation above 60 should clamp to 60"
+	cue.set_elevation(30.0)
+	if error.is_empty() and not is_equal_approx(cue.cue_elevation_degrees, 30.0):
+		error = "an in-range elevation should be kept as-is"
+	return _free_cue(cue, error)
+
+
+func _test_elevated_strike_direction() -> String:
+	var cue: Node3D = CUE_STICK.new()
+	cue.aim_direction = Vector3(0.0, 0.0, 1.0)
+	cue.set_elevation(30.0)
+	var direction: Vector3 = cue._strike_direction()
+	var error := ""
+	if not is_equal_approx(direction.y, sin(deg_to_rad(30.0))):
+		error = "elevated strike direction y component %.4f; expected %.4f" % [direction.y, sin(deg_to_rad(30.0))]
+	if error.is_empty() and not is_equal_approx(direction.length(), 1.0):
+		error = "elevated strike direction must stay normalized, got length %.4f" % direction.length()
+	return _free_cue(cue, error)
 
 
 func _free_cue(cue: Node3D, error: String) -> String:

@@ -12,6 +12,7 @@ const TableBuilderTests := preload("res://tests/test_table_builder.gd")
 const CueInputStateTests := preload("res://tests/test_cue_input_state.gd")
 const AIOpponentTests := preload("res://tests/test_ai_opponent.gd")
 const TextureGeneratorTests := preload("res://tests/test_texture_generator.gd")
+const GameFlowTests := preload("res://tests/test_game_flow.gd")
 
 
 func _init() -> void:
@@ -26,12 +27,14 @@ func _run() -> void:
 	var cue_input_suite := CueInputStateTests.new()
 	var ai_suite := AIOpponentTests.new()
 	var texture_suite := TextureGeneratorTests.new()
+	var game_flow_suite := GameFlowTests.new()
 	var physics_exit_code: int = physics_suite.run()
 	var rules_exit_code: int = rules_suite.run()
 	var nine_ball_rules_exit_code: int = nine_ball_rules_suite.run()
 	var cue_input_exit_code: int = cue_input_suite.run()
 	var ai_exit_code: int = ai_suite.run()
 	var texture_exit_code: int = texture_suite.run()
+	var game_flow_exit_code: int = game_flow_suite.run()
 	var table_or_error: Variant = table_suite.create_table()
 	var table_exit_code := 1
 	if table_or_error is Node3D:
@@ -43,5 +46,5 @@ func _run() -> void:
 		await process_frame
 	else:
 		printerr("FAIL: table builder smoke could not instantiate TableBuilder")
-	var exit_code: int = max(physics_exit_code, max(rules_exit_code, max(nine_ball_rules_exit_code, max(cue_input_exit_code, max(ai_exit_code, max(texture_exit_code, table_exit_code))))))
+	var exit_code: int = max(physics_exit_code, max(rules_exit_code, max(nine_ball_rules_exit_code, max(cue_input_exit_code, max(ai_exit_code, max(texture_exit_code, max(table_exit_code, game_flow_exit_code)))))))
 	quit(exit_code)

@@ -59,7 +59,7 @@ func _process(delta: float) -> void:
 	hud.set_shot_controls_visible(not shot_in_progress and not ai_turn_active)
 	if GameManager.ball_in_hand and not ai_turn_active:
 		_process_ball_in_hand_movement(delta)
-	if not GameManager.is_game_over() and cue_stick.can_adjust_aim():
+	if not GameManager.is_game_over() and not ai_turn_active and cue_stick.can_adjust_aim():
 		cue_stick.aim_direction = camera_rig.aim_direction
 
 
@@ -98,11 +98,9 @@ func _sync_camera_input_with_cue_state() -> void:
 		)
 
 func _unhandled_input(event: InputEvent) -> void:
-	if event is InputEventMouseButton and event.pressed and event.button_index == MOUSE_BUTTON_LEFT:
-		_try_click_eight_pocket(event.position)
-	elif event is InputEventScreenTouch and event.pressed:
-		_try_click_eight_pocket(event.position)
 	if not (event is InputEventKey) or not event.pressed or event.echo:
+		return
+	if ai_turn_active and (event.keycode == KEY_Q or event.keycode == KEY_E):
 		return
 	if event.keycode == KEY_Q:
 		cue_stick.set_elevation(cue_stick.cue_elevation_degrees - 2.0)
@@ -198,6 +196,17 @@ func _finalize_ball_in_hand_placement() -> void:
 	hud.set_status("%s — drag power to shoot" % GameManager.turn_label())
 
 func can_shoot() -> bool:
+	# Once the 8 is the only legal target, a pocket must be called before the
+	# stroke - the HUD hides the power/spin controls for the same reason, but
+	# that's UI polish only. This is the actual rule enforcement, so the shot
+	# can't slip through some other input path (or ball-in-hand) uncalled.
+	# (Checked separately from _can_strike so calling a pocket, which itself
+	# requires the table to be ready to strike, doesn't deadlock against this.)
+	if GameManager.can_call_eight_pocket() and GameManager.called_eight_pocket == "":
+		return false
+	return _can_strike()
+
+func _can_strike() -> bool:
 	if not GameManager.can_begin_shot():
 		return false
 	if cue_ball == null or shot_in_progress:
@@ -405,42 +414,13 @@ func _on_shot_resolved(result: Dictionary) -> void:
 
 
 func can_call_eight_pocket() -> bool:
-	return not ai_turn_active and can_shoot() and GameManager.can_call_eight_pocket()
+	return not ai_turn_active and _can_strike() and GameManager.can_call_eight_pocket()
 
 
 ## Lets the player call the 8-ball's pocket by clicking/tapping directly on
 ## it, instead of only through the HUD dropdown. Raycasts against the pocket
 ## Area3D nodes (collision layer 4, built by TableBuilder) rather than the
 ## dropdown's pocket list, so it stays correct if pocket geometry changes.
-func _try_click_eight_pocket(screen_position: Vector2) -> bool:
-	if not can_call_eight_pocket():
-		return false
-	var camera: Camera3D = camera_rig.camera
-	if camera == null:
-		return false
-	var origin := camera.project_ray_origin(screen_position)
-	var direction := camera.project_ray_normal(screen_position)
-	var query := PhysicsRayQueryParameters3D.create(origin, origin + direction * 50.0)
-	query.collision_mask = 4
-	query.collide_with_areas = true
-	query.collide_with_bodies = false
-	var result := get_world_3d().direct_space_state.intersect_ray(query)
-	if result.is_empty():
-		return false
-	var collider: Object = result.get("collider")
-	if collider == null or not (collider is Area3D):
-		return false
-	var area_name: String = collider.name
-	if not area_name.begins_with("Pocket_"):
-		return false
-	var pocket_id := area_name.substr(len("Pocket_"))
-	if not call_eight_pocket(pocket_id):
-		return false
-	if hud.has_method("select_called_pocket"):
-		hud.call("select_called_pocket", pocket_id)
-	return true
-
-
 func call_eight_pocket(pocket_id: String) -> bool:
 	if not can_call_eight_pocket():
 		return false

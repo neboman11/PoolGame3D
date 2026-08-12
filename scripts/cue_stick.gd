@@ -54,6 +54,7 @@ var _suppress_power_phase_change := false
 var _post_impact_elapsed := 0.0
 var _fade_elapsed := 0.0
 var _hidden_for_thinking := false
+var _ai_exact_aim_lock := false
 
 var aim_direction := Vector3.FORWARD:
 	set(value):
@@ -172,9 +173,10 @@ func set_hidden_for_thinking(hidden: bool) -> void:
 ## ball, entirely through the ordinary pull_amount used by human input so the
 ## visual matches a real stroke. Leaves the cue aimed and at pull_amount 0,
 ## ready for take_shot() to fire the actual impulse.
-func animate_ai_stroke(power_ratio: float) -> void:
+func animate_ai_stroke(power_ratio: float, exact_aim: bool = false) -> void:
 	if cue_ball == null or cue_ball.pocketed:
 		return
+	_ai_exact_aim_lock = exact_aim
 	set_hidden_for_thinking(false)
 	_reset_pull_amount()
 	var target_pull := clampf(power_ratio, 0.0, 1.0)
@@ -193,6 +195,7 @@ func set_ready_to_shoot() -> void:
 	input_phase = InputPhase.READY
 	_spin_input_active = false
 	_locked_aim_direction = aim_direction
+	_ai_exact_aim_lock = false
 	_post_impact_elapsed = 0.0
 	_fade_elapsed = 0.0
 	if cue_ball != null and not cue_ball.pocketed:
@@ -200,6 +203,9 @@ func set_ready_to_shoot() -> void:
 
 
 func _lock_aim() -> void:
+	if _ai_exact_aim_lock:
+		_locked_aim_direction = aim_direction
+		return
 	var jitter := randf_range(-STROKE_JITTER_RADIANS, STROKE_JITTER_RADIANS)
 	_locked_aim_direction = aim_direction.rotated(Vector3.UP, jitter)
 

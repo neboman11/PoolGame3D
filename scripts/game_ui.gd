@@ -150,9 +150,8 @@ func _process(_delta: float) -> void:
 			set_status("Drag the power bar to shoot")
 
 
-## Keeps the on-table glowing ring and the preview-window marker in sync
-## with whichever pocket is currently called, however it was called (preview
-## marker or clicking the pocket directly on the table).
+## Keeps the preview-window marker and optional table glow in sync with the
+## pocket selected from the top-down preview.
 func _sync_eight_pocket_highlight() -> void:
 	_update_marker_highlight(GameManager.called_eight_pocket)
 	if game_ref == null or game_ref.table == null:
@@ -246,9 +245,7 @@ func _make_marker_style(selected: bool, hovered: bool = false) -> StyleBoxFlat:
 	return style
 
 
-## Updates marker styling to match a pocket called from either input path
-## (see Game._try_click_eight_pocket for the on-table click path), and keeps
-## the preview panel's "pick a pocket" alert in sync with the same state.
+## Updates the top-down marker styling and its "pick a pocket" alert.
 func _update_marker_highlight(pocket_id: String) -> void:
 	for id in _pocket_marker_buttons:
 		var button: Button = _pocket_marker_buttons[id]

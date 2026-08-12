@@ -28,9 +28,13 @@ const MAX_RAIL_BOUNCES := 4
 # so the traced path always matches what would actually happen.
 const MAX_PREVIEW_STEPS := 3000
 # With Settings.extended_aim_preview on, the trace keeps going past the cue
-# ball's first contact - following every ball it (or a ball it struck) goes on
-# to hit, so a combo can be lined up visually. Capped so a wild break-like
-# scatter can't produce an unbounded number of chain segments to draw.
+# ball's first contact and records every ball that becomes involved in the
+# collision sequence, all the way to its final resting position. This is a
+# generous 40-second safety net; normal table friction settles much sooner.
+const MAX_EXTENDED_PREVIEW_STEPS := 7200
+const EXTENDED_PATH_SAMPLE_DISTANCE_SQUARED := 0.0001
+# Kept for the legacy sequential helper below; extended preview now uses the
+# full-table rollout instead.
 const MAX_EXTENDED_CONTACTS := 4
 # Aim must hold still this long before a trace is dispatched. Debounced
 # rather than throttled: while the camera is being dragged fast the aim
@@ -40,10 +44,9 @@ const MAX_EXTENDED_CONTACTS := 4
 const AIM_SETTLE_DELAY := 0.06
 const VECTOR_LINE_SCALE := 0.16 # world units of drawn line per m/s of predicted speed
 const AIM_EPSILON := 0.0005
-const IMPACT_COLOR := Color(1.0, 0.92, 0.4, 0.9)
-const CUE_VECTOR_COLOR := Color(0.35, 0.85, 1.0, 0.95)
-const OBJECT_VECTOR_COLOR := Color(1.0, 0.4, 0.3, 0.95)
-const CHAIN_PATH_COLOR := Color(1.0, 0.55, 0.15, 0.85)
+const CUE_PATH_COLOR := Color(0.94, 0.91, 0.83, 0.95)
+const STRIPE_ACCENT_COLOR := Color(0.94, 0.91, 0.83, 0.95)
+const STRIPE_DASH_LENGTH := 0.045
 
 var game: Node = null
 var enabled := false:
@@ -111,9 +114,9 @@ func toggle() -> bool:
 
 func _ready() -> void:
 	visible = enabled
-	_style_line(impact_line, IMPACT_COLOR)
-	_style_line(cue_vector_line, CUE_VECTOR_COLOR)
-	_style_line(object_vector_line, OBJECT_VECTOR_COLOR)
+	_style_line(impact_line)
+	_style_line(cue_vector_line)
+	_style_line(object_vector_line)
 
 
 func _exit_tree() -> void:
@@ -210,14 +213,25 @@ func _dispatch_prediction(strike: Dictionary, cue_position: Vector3) -> void:
 	_ensure_shadow()
 	var cue_number: int = game.cue_ball.ball_number
 	var ball_snapshots: Array = []
+	var ball_styles: Dictionary = {}
 	for ball in game.balls:
 		if not is_instance_valid(ball) or ball.pocketed:
 			continue
 		ball_snapshots.append({"number": ball.ball_number, "position": ball.global_position})
+		ball_styles[ball.ball_number] = _ball_preview_style(ball.ball_number)
 
 	var extended: bool = Settings.extended_aim_preview
-	_task_id = WorkerThreadPool.add_task(_run_prediction.bind(strike, cue_position, ball_snapshots, cue_number, extended))
+	_task_id = WorkerThreadPool.add_task(_run_prediction.bind(strike, cue_position, ball_snapshots, cue_number, extended, ball_styles))
 	_task_in_flight = true
+
+
+func _ball_preview_style(ball_number: int) -> Dictionary:
+	if ball_number == 0:
+		return {"color": CUE_PATH_COLOR, "striped": false}
+	return {
+		"color": TextureGen.get_ball_color(ball_number),
+		"striped": TextureGen.is_stripe(ball_number),
+	}
 
 
 func _reap_task_if_done() -> void:
@@ -247,12 +261,12 @@ func _reap_task_if_done() -> void:
 	_try_dispatch()
 
 
-func _style_line(mesh_instance: MeshInstance3D, color: Color) -> void:
+func _style_line(mesh_instance: MeshInstance3D) -> void:
 	mesh_instance.mesh = ImmediateMesh.new()
 	var material := StandardMaterial3D.new()
 	material.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
 	material.vertex_color_use_as_albedo = true
-	material.albedo_color = color
+	material.albedo_color = Color.WHITE
 	material.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
 	material.no_depth_test = true
 	mesh_instance.material_override = material
@@ -269,18 +283,19 @@ func _clear() -> void:
 
 
 func _draw(prediction: Dictionary) -> void:
-	_draw_path(impact_line, prediction["path"])
+	_draw_path(impact_line, prediction["path"], CUE_PATH_COLOR, false)
 	var impact_point: Vector3 = prediction["impact_point"]
-	_draw_segment(cue_vector_line, impact_point, impact_point + prediction["cue_after_direction"] * prediction["cue_after_length"])
+	_draw_segment(cue_vector_line, impact_point, impact_point + prediction["cue_after_direction"] * prediction["cue_after_length"], CUE_PATH_COLOR, false)
 	if prediction["has_target"]:
-		_draw_segment(object_vector_line, prediction["object_start"], prediction["object_start"] + prediction["object_after_direction"] * prediction["object_after_length"])
+		_draw_segment(object_vector_line, prediction["object_start"], prediction["object_start"] + prediction["object_after_direction"] * prediction["object_after_length"], prediction["object_color"], prediction["object_striped"])
 	else:
 		var mesh: ImmediateMesh = object_vector_line.mesh
 		mesh.clear_surfaces()
 
 	var object_paths: Array = prediction.get("object_paths", [])
 	for i in range(object_paths.size()):
-		_draw_path(_ensure_chain_line(i), object_paths[i])
+		var path: Dictionary = object_paths[i]
+		_draw_path(_ensure_chain_line(i), path["points"], path["color"], path["striped"])
 	for i in range(object_paths.size(), _chain_lines.size()):
 		var stale_mesh: ImmediateMesh = _chain_lines[i].mesh
 		stale_mesh.clear_surfaces()
@@ -290,31 +305,56 @@ func _ensure_chain_line(index: int) -> MeshInstance3D:
 	while _chain_lines.size() <= index:
 		var chain_line := MeshInstance3D.new()
 		add_child(chain_line)
-		_style_line(chain_line, CHAIN_PATH_COLOR)
+		_style_line(chain_line)
 		_chain_lines.append(chain_line)
 	return _chain_lines[index]
 
 
-func _draw_segment(mesh_instance: MeshInstance3D, from: Vector3, to: Vector3) -> void:
-	var mesh: ImmediateMesh = mesh_instance.mesh
-	mesh.clear_surfaces()
-	if from.distance_squared_to(to) < 0.0000001:
-		return
-	mesh.surface_begin(Mesh.PRIMITIVE_LINES)
-	mesh.surface_add_vertex(to_local(from) + Vector3.UP * 0.002)
-	mesh.surface_add_vertex(to_local(to) + Vector3.UP * 0.002)
-	mesh.surface_end()
+func _draw_segment(mesh_instance: MeshInstance3D, from: Vector3, to: Vector3, color: Color, striped: bool) -> void:
+	_draw_path(mesh_instance, [from, to], color, striped)
 
 
-func _draw_path(mesh_instance: MeshInstance3D, points: Array) -> void:
+func _draw_path(mesh_instance: MeshInstance3D, points: Array, color: Color, striped: bool) -> void:
 	var mesh: ImmediateMesh = mesh_instance.mesh
 	mesh.clear_surfaces()
 	if points.size() < 2:
 		return
-	mesh.surface_begin(Mesh.PRIMITIVE_LINE_STRIP)
-	for point in points:
-		mesh.surface_add_vertex(to_local(point) + Vector3.UP * 0.002)
+	mesh.surface_begin(Mesh.PRIMITIVE_LINES if striped else Mesh.PRIMITIVE_LINE_STRIP)
+	if striped:
+		_draw_striped_path(mesh, points, color)
+	else:
+		for point in points:
+			_add_path_vertex(mesh, point, color)
 	mesh.surface_end()
+
+
+func _draw_striped_path(mesh: ImmediateMesh, points: Array, color: Color) -> void:
+	var color_segment := true
+	var distance_to_switch := STRIPE_DASH_LENGTH
+	for index in range(points.size() - 1):
+		var cursor: Vector3 = points[index]
+		var segment_end: Vector3 = points[index + 1]
+		var segment_direction := cursor.direction_to(segment_end)
+		var segment_remaining := cursor.distance_to(segment_end)
+		if segment_remaining <= 0.000001:
+			continue
+		while segment_remaining > 0.000001:
+			var length := minf(segment_remaining, distance_to_switch)
+			var dash_end := cursor + segment_direction * length
+			var dash_color := color if color_segment else STRIPE_ACCENT_COLOR
+			_add_path_vertex(mesh, cursor, dash_color)
+			_add_path_vertex(mesh, dash_end, dash_color)
+			cursor = dash_end
+			segment_remaining -= length
+			distance_to_switch -= length
+			if distance_to_switch <= 0.000001:
+				color_segment = not color_segment
+				distance_to_switch = STRIPE_DASH_LENGTH
+
+
+func _add_path_vertex(mesh: ImmediateMesh, point: Vector3, color: Color) -> void:
+	mesh.surface_set_color(color)
+	mesh.surface_add_vertex(to_local(point) + Vector3.UP * 0.002)
 
 
 func _ensure_shadow() -> void:
@@ -351,7 +391,7 @@ func _on_shadow_cushion(ball: Variant, _cushion_id: Variant) -> void:
 ## ball first contacts another ball. Runs on a WorkerThreadPool thread - must
 ## not touch `game`, scene nodes, or anything outside its arguments and
 ## `_shadow` (which the caller guarantees no other thread is using).
-func _run_prediction(strike: Dictionary, cue_start: Vector3, ball_snapshots: Array, cue_number: int, extended: bool) -> void:
+func _run_prediction(strike: Dictionary, cue_start: Vector3, ball_snapshots: Array, cue_number: int, extended: bool, ball_styles: Dictionary) -> void:
 	_shadow.unregister_all()
 
 	for entry in ball_snapshots:
@@ -405,6 +445,7 @@ func _run_prediction(strike: Dictionary, cue_start: Vector3, ball_snapshots: Arr
 	var object_state: Dictionary = snapshot[other_id]
 	var cue_velocity: Vector3 = cue_state["velocity"]
 	var object_velocity: Vector3 = object_state["velocity"]
+	var object_style: Dictionary = ball_styles[other_id]
 	path.append(cue_state["position"])
 	result = {
 		"path": path,
@@ -415,13 +456,76 @@ func _run_prediction(strike: Dictionary, cue_start: Vector3, ball_snapshots: Arr
 		"object_start": object_state["position"],
 		"object_after_direction": object_velocity.normalized() if object_velocity.length() > 0.001 else Vector3.ZERO,
 		"object_after_length": object_velocity.length() * VECTOR_LINE_SCALE,
+		"object_color": object_style["color"],
+		"object_striped": object_style["striped"],
 		"object_paths": [],
 	}
 	if extended:
-		result["object_paths"] = _trace_extended_chain(other_id, object_state["position"], cue_number)
+		result["object_paths"] = _trace_extended_paths(snapshot, ball_styles)
 	_pending_result = result
 
 
+## Continues the exact shadow simulation after the first contact and records a
+## path for every ball touched by the shot. Unlike the old single-chain trace,
+## this follows branches, cue-ball recontacts, and secondary collisions until
+## the whole table has settled.
+func _trace_extended_paths(initial_snapshot: Dictionary, ball_styles: Dictionary) -> Array:
+	var paths_by_ball: Dictionary = {}
+	var snapshot := initial_snapshot
+
+	for ball_id in snapshot:
+		var state: Dictionary = snapshot[ball_id]
+		if not bool(state.get("pocketed", false)) and state["velocity"].length_squared() > 0.0:
+			paths_by_ball[ball_id] = [state["position"]]
+
+	var steps := 0
+	while not _shadow.is_settled() and steps < MAX_EXTENDED_PREVIEW_STEPS:
+		_contact_events_this_step.clear()
+		_cushion_hits_this_step.clear()
+		_shadow.step(_shadow.fixed_step)
+		steps += 1
+		snapshot = _shadow.snapshot()
+
+		for event in _contact_events_this_step:
+			_track_extended_ball_path(int(event[0]), snapshot, paths_by_ball)
+			_track_extended_ball_path(int(event[1]), snapshot, paths_by_ball)
+
+		for ball_id in paths_by_ball:
+			if not snapshot.has(ball_id):
+				continue
+			var state: Dictionary = snapshot[ball_id]
+			_append_extended_path_point(paths_by_ball[ball_id], state["position"], false)
+
+	for ball_id in paths_by_ball:
+		if snapshot.has(ball_id):
+			_append_extended_path_point(paths_by_ball[ball_id], snapshot[ball_id]["position"], true)
+
+	var styled_paths: Array = []
+	for ball_id in paths_by_ball:
+		var style: Dictionary = ball_styles.get(ball_id, {"color": Color.WHITE, "striped": false})
+		styled_paths.append({
+			"points": paths_by_ball[ball_id],
+			"color": style["color"],
+			"striped": style["striped"],
+		})
+	return styled_paths
+
+
+func _track_extended_ball_path(ball_id: int, snapshot: Dictionary, paths_by_ball: Dictionary) -> void:
+	if paths_by_ball.has(ball_id) or not snapshot.has(ball_id):
+		return
+	var state: Dictionary = snapshot[ball_id]
+	if not bool(state.get("pocketed", false)):
+		paths_by_ball[ball_id] = [state["position"]]
+
+
+func _append_extended_path_point(path: Array, position: Vector3, force: bool) -> void:
+	if path.is_empty() or force or path[path.size() - 1].distance_squared_to(position) >= EXTENDED_PATH_SAMPLE_DISTANCE_SQUARED:
+		path.append(position)
+
+
+## Legacy sequential trace retained for callers that need a single collision
+## branch. The extended aim preview uses _trace_extended_paths() instead.
 ## Continues the shadow simulation past the cue ball's first contact, following
 ## the struck ball (and whatever it goes on to hit) through up to
 ## MAX_EXTENDED_CONTACTS further collisions, so a combo can be lined up
